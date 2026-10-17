@@ -165,8 +165,44 @@ def wsl_run(distro: str, args: list[str], **kwargs) -> subprocess.CompletedProce
         raise
 
 
+def _pid_alive(pid: int) -> bool:
+    """判断进程是否还在（用于识别残留锁）。"""
+    if pid <= 0:
+        return False
+    try:
+        import psutil                       # 装了就用它，最准
+        return psutil.pid_exists(pid)
+    except ImportError:
+        pass
+    if os.name == "nt":
+        import ctypes
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _lock_owner(path: Path) -> int | None:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = re.search(r"pid=(\d+)", text)
+    return int(match.group(1)) if match else None
+
+
 class SandboxLock:
-    """同一时刻只允许一个进程动这个沙箱，避免并发互相干扰。"""
+    """同一时刻只允许一个进程动这个沙箱，避免并发互相干扰。
+
+    残留判定：锁里记了持有者 pid，进程没了就立刻接管（不必等时间阈值）；
+    锁文件读不出 pid 时才退回"超过 STALE_SECONDS 视为残留"。
+    """
 
     STALE_SECONDS = 30 * 60
 
@@ -180,13 +216,18 @@ class SandboxLock:
                 fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             except FileExistsError:
                 age = time.time() - self.path.stat().st_mtime
-                if attempt == 1 and age > self.STALE_SECONDS:
-                    eprint("[bash.py] 发现超过 30 分钟未更新的锁文件，视为残留并接管")
+                owner = _lock_owner(self.path)
+                dead = owner is not None and not _pid_alive(owner)
+                orphan = owner is None and age > 60      # 内容坏了/为空
+                if attempt == 1 and (dead or orphan or age > self.STALE_SECONDS):
+                    reason = (f"持有进程 {owner} 已不存在" if dead
+                              else f"锁已 {age / 60:.0f} 分钟未更新")
+                    eprint(f"[bash.py] 清理残留锁（{reason}）")
                     self.path.unlink(missing_ok=True)
                     continue
                 raise SandboxError(
                     f"另一个 bash.py 正在使用沙箱（{self.path.name}，"
-                    f"{age:.0f} 秒前创建）。\n"
+                    f"pid={owner}，{age:.0f} 秒前创建）。\n"
                     "等它结束后重试；若确认没有其它进程，删除该文件即可。")
             else:
                 os.write(fd, f"pid={os.getpid()} {time.strftime('%Y-%m-%d %H:%M:%S')}\n".encode())

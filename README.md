@@ -69,6 +69,23 @@ python bash.py --reset --yes                            # 清空沙箱（下次�
 
 退出码即沙箱内命令的退出码：`python bash.py "exit 42"` → 本进程退出码 42；超时返回 124。
 
+### 长任务与超时（重要）
+
+* **默认不限时**：不传 `--timeout` 时 `bash.py` 不会给你加任何上限，前台任务能跑多久跑多久
+  （实测 90 秒任务正常跑完、退出码 0）。适合编译、跑测试、下载大文件。
+* **传 `--timeout N` 才会停**：到点强制终止，退出码 **124**，并且**已经打印的输出会保留**
+  （实测 5 秒任务被 4 秒掐断时，前 4 个 tick 都在）。超时是**真杀进程**，实测宿主里没有残留。
+* **上游超时也算**：如果调用方（终端、CI、Agent 工具）自己设了更短的超时，那是上游掐断，
+  不是 `bash.py` 的限制。
+* **不能后台常驻**：每次调用都是独立的 mount + PID 命名空间，`python bash.py` 一退出，
+  里面的进程全部被内核杀掉。`nohup` / `&` / `setsid` / `systemd` / 守护进程都活不下来，
+  下一次调用也看不到（实测：宿主里 0 个、下一次调用里 0 个）。
+  持久化的是**文件**（`sandbox/data/`），不是进程。
+* 需要"跨多次调用推进"的长任务：把进度写进文件，分几次调用继续跑；
+  真要常驻服务，别放在沙箱里 —— 用宿主 WSL（`wsl -u root -- nohup ... &`）、Windows 任务计划，
+  或自己加一个 `--bg` 模式。
+* 长任务建议边跑边输出（`echo` / `--verbose`）：输出是实时透传的，长时间无输出容易被误以为卡死。
+
 ### 工作原理
 
 ```
@@ -207,6 +224,25 @@ python bash.py --reset --yes                             # wipe the sandbox (aut
 
 The process exit code is the command's exit code: `python bash.py "exit 42"` exits 42, and a
 timeout returns 124.
+
+### Long-running tasks & timeouts
+
+* **No limit by default**: without `--timeout`, `bash.py` imposes no cap at all — a foreground
+  task runs as long as it needs (verified with a 90-second job, exit code 0). Good for builds,
+  test suites, big downloads.
+* **`--timeout N` is opt-in**: the command is killed at N seconds, the exit code becomes **124**,
+  and **output printed so far is preserved** (a 5-second job cut at 4 s still shows the first four
+  ticks). The kill is real — no orphan processes are left on the host.
+* **Upstream timeouts also count**: a shorter timeout in your terminal, CI job or agent tool will
+  cut it off; that is not `bash.py`'s limit.
+* **No background daemons**: every call gets its own mount + PID namespace, and when
+  `python bash.py` exits the kernel kills everything inside it. `nohup` / `&` / `setsid` /
+  `systemd` / daemons do not survive and are invisible to the next call (verified: 0 processes on
+  the host, 0 in the following call). What persists is **files** (`sandbox/data/`), not processes.
+* To advance a long job across calls, keep progress in files and resume; for a real always-on
+  service, run it outside the sandbox (host WSL with `nohup`, Windows Task Scheduler), or add a
+  `--bg` mode.
+* Prefer tasks that emit progress: output is streamed live, and long silences look like a hang.
 
 ### How it works
 
