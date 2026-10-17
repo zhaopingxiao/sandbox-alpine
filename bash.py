@@ -68,6 +68,7 @@ LEGACY_IMAGE = SANDBOX_DIR / "alpine-rootfs.img"  # 旧版 ext4 镜像（已不�
 DOWNLOAD_DIR = SANDBOX_DIR / "downloads"
 STAGING_DIR = SANDBOX_DIR / "staging"
 LOG_DIR = SANDBOX_DIR / "runs"
+SERVICES_DIR = SANDBOX_DIR / "services"          # 常驻服务：每个服务一个目录（pid/日志/meta）
 META_PATH = SANDBOX_DIR / "sandbox.json"
 MARKER_PATH = SANDBOX_DIR / ".provisioned"
 
@@ -692,6 +693,225 @@ def execute(opts: argparse.Namespace, command: str) -> int:
     return code
 
 
+# --------------------------------------------------------------------------- 常驻服务
+#
+# 为什么服务不能走普通的 run_in_sandbox：
+#   普通执行用的是 PID 命名空间，`python bash.py` 一退出命名空间就被销毁，里面的进程全被杀。
+# 服务的做法：
+#   * mount 命名空间私有（proc/sys/dev 只挂给这个服务，宿主挂载表不受影响）；
+#   * 由一个**独立的 wsl.exe 进程**在前台持有服务，Windows 侧用 Popen 以
+#     DETACHED_PROCESS 脱离父进程 —— 所以 `python bash.py` 退出后服务继续跑；
+#   * supervisor 自己把 stdout/stderr 重定向到日志文件（wsl 会分配 pty，光靠继承文件句柄抓不到输出）；
+#   * 记两个 pid：winpid（持有它的 wsl.exe）和 linux pid（服务本身），停服务时两边都清。
+# 注意：`wsl --shutdown`、注销 WSL 或杀掉那个 wsl.exe 都会结束服务。
+
+_SERVICE_SUPERVISOR = r"""
+#!/bin/sh
+# 由 bash.py 生成：服务 supervisor（在私有 mount 命名空间里执行）
+# 执行链全程 exec 不 fork，所以这里 $$ 就是服务的宿主 pid
+echo $$ > __PID_Q__
+exec >> __LOG_Q__ 2>&1          # 之后所有输出（含 mount 报错、服务自身输出）都进日志
+mount -t proc proc __ROOT_Q__/proc 2>/dev/null || true
+mount -t sysfs sysfs __ROOT_Q__/sys 2>/dev/null || true
+mount --rbind /dev __ROOT_Q__/dev 2>/dev/null || true
+cd __ROOT_Q__ || exit 1
+exec chroot __ROOT_Q__ /usr/bin/env -i \
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  HOME=/root USER=root SHELL=/bin/sh LANG=C.UTF-8 TERM=xterm \
+  /bin/sh -c __CMD_Q__
+"""
+
+SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$")
+
+# Windows 进程创建标志：脱离控制台，父进程退出后继续活
+_DETACHED = 0x00000008 | 0x00000200 | 0x08000000      # DETACHED_PROCESS | NEW_PROCESS_GROUP | NO_WINDOW
+
+
+def service_paths(name: str) -> dict:
+    base = SERVICES_DIR / name
+    return {"dir": base, "pid": base / "pid", "winpid": base / "winpid",
+            "log": base / "service.log", "meta": base / "meta.json",
+            "supervisor": base / "supervisor.sh"}
+
+
+def _read_int(path: Path) -> int | None:
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def service_pid(name: str) -> int | None:
+    return _read_int(service_paths(name)["pid"])
+
+
+def service_winpid(name: str) -> int | None:
+    return _read_int(service_paths(name)["winpid"])
+
+
+def _win_pid_alive(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        import psutil
+        return psutil.pid_exists(pid)
+    except ImportError:
+        return True
+
+
+def service_alive(pid: int | None, opts: argparse.Namespace) -> bool:
+    """Linux 侧的进程是否还活着。"""
+    if not pid:
+        return False
+    try:
+        proc = wsl_run(opts.distro, ["sh", "-c", f"kill -0 {pid} 2>/dev/null"], timeout=30)
+        return proc.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def service_start(opts: argparse.Namespace, name: str, command: str) -> int:
+    if not SERVICE_NAME_RE.fullmatch(name or ""):
+        raise SandboxError("服务名只能是字母/数字/点/下划线/减号，最长 40 字符")
+    if not (command or "").strip():
+        raise SandboxError('要启动服务需要给出命令，例如: '
+                           'python bash.py --service-start web "python3 -m http.server 8080"')
+    ensure_sandbox(opts)
+    paths = service_paths(name)
+    old_pid = service_pid(name)
+    if service_alive(old_pid, opts) or _win_pid_alive(service_winpid(name)):
+        if not opts.force:
+            print(f"服务 {name} 已在运行（pid {old_pid}）。要重启请先 --service-stop {name}，"
+                  f"或加 --force 强制重启。")
+            return 1
+        service_stop(opts, name)
+    paths["dir"].mkdir(parents=True, exist_ok=True)
+
+    supervisor = (_SERVICE_SUPERVISOR
+                  .replace("__ROOT_Q__", sh_quote(to_wsl_path(ROOT_DIR)))
+                  .replace("__PID_Q__", sh_quote(to_wsl_path(paths["pid"])))
+                  .replace("__LOG_Q__", sh_quote(to_wsl_path(paths["log"])))
+                  .replace("__CMD_Q__", sh_quote(command)))
+    paths["supervisor"].write_bytes(supervisor.replace("\r\n", "\n").encode("utf-8"))
+    paths["pid"].unlink(missing_ok=True)
+    paths["winpid"].unlink(missing_ok=True)
+    paths["log"].write_text(
+        f"# 服务 {name} 启动于 {time.strftime('%Y-%m-%d %H:%M:%S')}\n# 命令: {command}\n",
+        encoding="utf-8")
+
+    # 用一个独立的 wsl.exe 进程前台持有服务；脱离控制台，父进程退出后继续
+    argv = wsl_argv(opts.distro, ["unshare", "-m", "--propagation", "private", "--",
+                                  "sh", to_wsl_path(paths["supervisor"])])
+    try:
+        holder = subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, creationflags=_DETACHED)
+    except OSError as exc:
+        raise SandboxError(f"无法启动 wsl.exe: {exc}") from exc
+    paths["winpid"].write_text(str(holder.pid), encoding="utf-8")
+
+    pid = None
+    for _ in range(50):                      # 等 supervisor 把 pid 写出来
+        time.sleep(0.1)
+        pid = service_pid(name)
+        if pid and service_alive(pid, opts):
+            break
+    if not pid or not service_alive(pid, opts):
+        tail = ""
+        try:
+            tail = "\n".join(paths["log"].read_text(encoding="utf-8", errors="replace")
+                             .splitlines()[-12:])
+        except OSError:
+            pass
+        try:
+            holder.terminate()
+        except OSError:
+            pass
+        raise SandboxError(f"服务似乎没起来，最近的日志:\n{tail or '(空)'}")
+
+    paths["meta"].write_text(json.dumps({
+        "name": name, "command": command, "pid": pid, "winpid": holder.pid,
+        "root": str(ROOT_DIR), "log": str(paths["log"]),
+        "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(f"服务 {name} 已启动（pid {pid}，持有进程 wsl.exe {holder.pid}）")
+    print(f"  命令: {command}")
+    print(f"  日志: {paths['log']}")
+    print(f"  查看: python bash.py --service-logs {name}      停止: python bash.py --service-stop {name}")
+    print("  说明: 它活在自己的 mount 命名空间里，退出 bash.py 不影响它；"
+          "监听端口的话 Windows 上一般可直接访问 http://localhost:<端口>。"
+          "`wsl --shutdown` 会一起结束。")
+    return 0
+
+
+def service_stop(opts: argparse.Namespace, name: str) -> int:
+    paths = service_paths(name)
+    pid, winpid = service_pid(name), service_winpid(name)
+    if not pid and not winpid:
+        print(f"服务 {name} 没有记录在运行。")
+        return 0
+    if not service_alive(pid, opts):
+        print(f"服务 {name} 已经不在运行。")
+        paths["pid"].unlink(missing_ok=True)
+        paths["winpid"].unlink(missing_ok=True)
+        return 0
+    # 1) 先按进程组从 Linux 侧杀（连带子进程）
+    wsl_run(opts.distro, ["sh", "-c", f"kill -TERM -- -{pid} 2>/dev/null || kill -TERM {pid}"],
+            timeout=30)
+    for _ in range(30):
+        time.sleep(0.1)
+        if not service_alive(pid, opts):
+            break
+    # 2) 还没死就杀掉持有它的 wsl.exe（连同整个进程树）
+    if service_alive(pid, opts) and _win_pid_alive(winpid):
+        try:
+            subprocess.run(["taskkill", "/PID", str(winpid), "/T", "/F"],
+                           capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    still = service_alive(pid, opts)
+    paths["pid"].unlink(missing_ok=True)
+    paths["winpid"].unlink(missing_ok=True)
+    print(f"服务 {name} {'仍在运行（可能需要手动检查）' if still else '已停止'}（pid {pid}）。")
+    return 1 if still else 0
+
+
+def service_list(opts: argparse.Namespace) -> int:
+    if not SERVICES_DIR.exists():
+        print("还没有任何服务。用 --service-start <名字> \"<命令>\" 启动一个。")
+        return 0
+    rows = []
+    for meta_file in sorted(SERVICES_DIR.glob("*/meta.json")):
+        name = meta_file.parent.name
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            meta = {}
+        pid = service_pid(name)
+        rows.append((name, pid, service_alive(pid, opts), meta))
+    if not rows:
+        print("还没有任何服务。")
+        return 0
+    print(f"{'服务':<14}{'状态':<9}{'PID':<8}{'启动时间':<20}命令")
+    for name, pid, alive, meta in rows:
+        print(f"{name:<14}{'运行中' if alive else '已停止':<9}{str(pid or '-'):<8}"
+              f"{str(meta.get('started', '-')):<20}{str(meta.get('command', '-'))[:56]}")
+    print("\n提示: 服务由独立的 wsl.exe 进程持有；`wsl --shutdown` 会把它们一起结束。")
+    return 0
+
+
+def service_logs(opts: argparse.Namespace, name: str, lines: int) -> int:
+    log = service_paths(name)["log"]
+    if not log.exists():
+        print(f"服务 {name} 没有日志（还没启动过？）。")
+        return 1
+    content = log.read_text(encoding="utf-8", errors="replace").splitlines()
+    for line in content[-max(1, lines):]:
+        print(line)
+    return 0
+
+
 # --------------------------------------------------------------------------- 其它子命令
 
 def show_info(opts: argparse.Namespace) -> int:
@@ -713,6 +933,14 @@ def show_info(opts: argparse.Namespace) -> int:
     print(f"供应标记   : {'已完整初始化' if MARKER_PATH.exists() else '缺少 .provisioned'}")
     logs = sorted(LOG_DIR.glob("*.log"))
     print(f"运行日志   : {len(logs)} 个 (最近: {logs[-1].name if logs else '无'})")
+    running = []
+    if SERVICES_DIR.exists():
+        for meta_file in sorted(SERVICES_DIR.glob("*/meta.json")):
+            name = meta_file.parent.name
+            if service_alive(service_pid(name), opts):
+                running.append(name)
+    print(f"常驻服务   : {len(running)} 个运行中"
+          + (f"（{', '.join(running)}）" if running else "（--service-list 查看全部）"))
     if LEGACY_IMAGE.exists():
         print(f"注意       : 还存在旧版镜像 {LEGACY_IMAGE.name}（已不用，--reset --yes 可删除）")
     print("--- 沙箱内部实况 ---")
@@ -727,7 +955,13 @@ def show_info(opts: argparse.Namespace) -> int:
 
 
 def reset_sandbox(opts: argparse.Namespace) -> int:
-    targets = [path for path in (ROOT_DIR, LEGACY_IMAGE) if path.exists()]
+    running = []
+    if SERVICES_DIR.exists():
+        for meta_file in sorted(SERVICES_DIR.glob("*/meta.json")):
+            name = meta_file.parent.name
+            if service_alive(service_pid(name), opts):
+                running.append(name)
+    targets = [path for path in (ROOT_DIR, LEGACY_IMAGE, SERVICES_DIR) if path.exists()]
     if not targets and not META_PATH.exists():
         print("沙箱不存在，无需清理。")
         return 0
@@ -735,8 +969,12 @@ def reset_sandbox(opts: argparse.Namespace) -> int:
         print("这会删除整个沙箱环境（含里面所有文件）:")
         for path in targets or [ROOT_DIR]:
             print(f"  - {path}")
+        if running:
+            print(f"  另外会先停止正在运行的服务: {', '.join(running)}")
         print("确认请执行: python bash.py --reset --yes")
         return 2
+    for name in running:
+        service_stop(opts, name)
     for path in targets:
         if path.is_dir():
             shutil.rmtree(path, ignore_errors=True)
@@ -747,7 +985,7 @@ def reset_sandbox(opts: argparse.Namespace) -> int:
     MARKER_PATH.unlink(missing_ok=True)
     for leftover in STAGING_DIR.glob("*"):
         leftover.unlink(missing_ok=True)
-    print(f'下次运行 python bash.py "..." 会自动重建一个干净的 Alpine 环境。')
+    print('下次运行 python bash.py "..." 会自动重建一个干净的 Alpine 环境。')
     return 0
 
 
@@ -769,6 +1007,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--info", action="store_true", help="显示沙箱环境信息")
     parser.add_argument("--reset", action="store_true", help="删除沙箱环境（需 --yes）")
     parser.add_argument("--yes", action="store_true", help="确认危险操作")
+    parser.add_argument("--force", action="store_true", help="允许覆盖同名正在运行的服务")
+    parser.add_argument("--service-start", metavar="NAME",
+                        help='启动一个常驻服务，命令用位置参数给，例如: '
+                             '--service-start web "busybox httpd -f -p 8080 -h /root"')
+    parser.add_argument("--service-stop", metavar="NAME", help="停止服务（按进程组杀）")
+    parser.add_argument("--service-list", action="store_true", help="列出所有服务及运行状态")
+    parser.add_argument("--service-logs", metavar="NAME", help="查看服务最近日志")
+    parser.add_argument("--lines", type=int, default=40, metavar="N",
+                        help="--service-logs 显示多少行，默认 40")
     parser.add_argument("--alpine-version", default=ALPINE_VERSION, help="Alpine 版本")
     parser.add_argument("--mirror", default="", metavar="URL",
                         help="指定 apk 镜像站（默认初始化时自动测速选择最快的）")
@@ -794,6 +1041,14 @@ def main(argv: list[str] | None = None) -> int:
     opts = build_parser().parse_args(argv)
     SANDBOX_DIR.mkdir(parents=True, exist_ok=True)
     with SandboxLock(SANDBOX_DIR / ".lock"):
+        if opts.service_start:
+            return service_start(opts, opts.service_start, " ".join(opts.cmd).strip())
+        if opts.service_stop:
+            return service_stop(opts, opts.service_stop)
+        if opts.service_list:
+            return service_list(opts)
+        if opts.service_logs:
+            return service_logs(opts, opts.service_logs, opts.lines)
         if opts.reset:
             return reset_sandbox(opts)
         if opts.init:

@@ -142,7 +142,45 @@ alpine-sandbox/
    换国内镜像后同样操作只要 **1~2 秒**。测速请求需伪装成 `apk-tools` 的 UA（中科大/清华会 403 掉
    wget 默认 UA）。
 
-### 已知限制
+#### 常驻服务（`--service-*`）
+
+普通执行用的是 PID 命名空间，`python bash.py` 一退出里面所有进程都会被内核杀掉 —— 所以
+**跑服务要用单独的一套指令**。它会把服务放进自己的 mount 命名空间，并交给一个独立的
+`wsl.exe` 进程在前台持有，所以 `python bash.py` 退出后服务继续跑：
+
+```powershell
+# 起一个常驻 HTTP 服务（Alpine 的 busybox 没编 httpd，先 apk add python3）
+python bash.py "apk add --no-cache python3"
+python bash.py --service-start web "python3 -m http.server 8080 --directory /root"
+#   → 服务 web 已启动（pid 871，持有进程 wsl.exe 14608）
+#   然后从 Windows 直接访问 http://localhost:8080/index.html 就行
+
+python bash.py --service-list                # 看所有服务的状态 / pid / 启动时间
+python bash.py --service-logs web            # 看服务最近输出（也可 --lines 200）
+python bash.py --service-stop web            # 停服务（先杀进程组，必要时杀掉持有进程）
+python bash.py --service-start web "..." --force   # 覆盖同名正在运行的服务
+```
+
+* 服务日志：`sandbox/services/<名字>/service.log`；pid：同目录下 `pid` / `winpid`。
+* 服务的 `/proc`、`/sys`、`/dev` 只在它自己的 mount 命名空间里，宿主挂载表不受影响。
+* 服务看到的文件系统就是 `sandbox/data/`，和普通命令完全一致。
+* **限制**：`wsl --shutdown`、注销 WSL、或杀掉那个持有进程，都会结束服务；服务看不到
+  PID 隔离（它和宿主 WSL 共享 PID 命名空间）；`--reset` 会先停掉正在运行的服务再删目录。
+
+### 关于 docker
+
+**沙箱里跑不了 dockerd**（也不是加个参数能解决的）：daemon 需要 cgroups、iptables、
+自己的 init、可写的 `/sys`，Restricted 环境下还要特权 —— 而这里只是一个 chroot +
+mount 命名空间。想要"容器"能力，按需要选：
+
+| 需求 | 做法 |
+| --- | --- |
+| 只是想跑容器 | Windows 上装 Docker Desktop（最省事） |
+| 想在 WSL 里有一套完整服务管理 | `wsl --import` 一个 Alpine 发行版，开 systemd/openrc，在那里当正常 Linux 用 |
+| 沙箱里需要 `docker` 命令 | 在**宿主 WSL** 装 docker daemon，把 `/var/run/docker.sock` 用 `-v` 挂进沙箱，沙箱里只装 docker CLI 去连宿主 daemon（CI 常见做法） |
+| 只是要"一直跑着"的用户态进程 | 就用上面的 `--service-start`（http/worker/定时循环都行） |
+
+## 已知限制
 
 * **不是安全隔离**：沙箱与宿主共享内核和网络（有 mount + PID 命名空间，没有用户/网络命名空间）。
   跑不受信任的代码请用容器或 `wsl --import` 独立发行版。
@@ -305,7 +343,48 @@ alpine-sandbox/
    brought the same command down to **1–2 s**. The probe must send an `apk-tools` User-Agent —
    USTC and TUNA answer `403` to wget's default UA.
 
-### Limitations
+#### Persistent services (`--service-*`)
+
+Normal execution runs inside a PID namespace, so when `python bash.py` exits the kernel kills
+everything in it. **Services therefore need their own commands**: the service runs in its own
+mount namespace and is held by a **detached `wsl.exe` process**, so it keeps running after
+`python bash.py` returns.
+
+```powershell
+# Alpine's busybox has no httpd applet, so install python3 first
+python bash.py "apk add --no-cache python3"
+python bash.py --service-start web "python3 -m http.server 8080 --directory /root"
+#   → service web started (pid 871, holder wsl.exe 14608)
+#   now open http://localhost:8080/index.html from Windows
+
+python bash.py --service-list                # status / pid / start time of every service
+python bash.py --service-logs web            # recent output (also --lines 200)
+python bash.py --service-stop web            # stop (process group first, holder if needed)
+python bash.py --service-start web "..." --force   # replace a running service of the same name
+```
+
+* Logs: `sandbox/services/<name>/service.log`; pids: `pid` and `winpid` in the same directory.
+* `/proc`, `/sys` and `/dev` are mounted **only in the service's private mount namespace** —
+  the host mount table is never touched. The service sees `sandbox/data/` as its root, exactly
+  like a normal command.
+* **Limits**: `wsl --shutdown`, unregistering WSL, or killing the holder process ends the
+  service; services share the host PID namespace (no PID isolation); `--reset` stops running
+  services before deleting the directory.
+
+### What about Docker?
+
+**You cannot run `dockerd` inside this sandbox**, and no flag will change that: the daemon needs
+cgroups, iptables, its own init, a writable `/sys` and (typically) privileges, while this is a
+chroot plus a mount namespace. Depending on what you actually need:
+
+| Need | Do this |
+| --- | --- |
+| Just run containers | Install Docker Desktop on Windows (simplest) |
+| A full Linux with real service management | `wsl --import` an Alpine distro, enable systemd/openrc, use it as a normal Linux |
+| `docker` CLI inside the sandbox | Run the daemon in the **host WSL**, bind `/var/run/docker.sock` in with `-v`, install only the CLI in the sandbox (common CI pattern) |
+| "Always running" user-space process | Use `--service-start` above (http servers, workers, polling loops) |
+
+## Limitations
 
 * **Not a security boundary**: the sandbox shares the host kernel and network (mount + PID namespaces,
   but no user/network namespace). For untrusted code use a container or an imported WSL distro.
