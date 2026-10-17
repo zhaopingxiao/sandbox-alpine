@@ -142,7 +142,7 @@ alpine-sandbox/
    换国内镜像后同样操作只要 **1~2 秒**。测速请求需伪装成 `apk-tools` 的 UA（中科大/清华会 403 掉
    wget 默认 UA）。
 
-#### 常驻服务（`--service-*`）
+### 常驻服务（`--service-*`）
 
 普通执行用的是 PID 命名空间，`python bash.py` 一退出里面所有进程都会被内核杀掉 —— 所以
 **跑服务要用单独的一套指令**。它会把服务放进自己的 mount 命名空间，并交给一个独立的
@@ -343,7 +343,7 @@ alpine-sandbox/
    brought the same command down to **1–2 s**. The probe must send an `apk-tools` User-Agent —
    USTC and TUNA answer `403` to wget's default UA.
 
-#### Persistent services (`--service-*`)
+### Persistent services (`--service-*`)
 
 Normal execution runs inside a PID namespace, so when `python bash.py` exits the kernel kills
 everything in it. **Services therefore need their own commands**: the service runs in its own
